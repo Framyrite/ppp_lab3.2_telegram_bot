@@ -2,11 +2,14 @@
 """Telegram-бот MoneyTrack для управления личными финансами."""
 
 import logging
+import random
 import sqlite3
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
 from telegram import Update
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -24,6 +27,14 @@ from database import (
     init_database,
     set_monthly_budget,
 )
+from reminders import (
+    add_reminder,
+    cancel_reminder,
+    get_due_reminders,
+    get_pending_reminders,
+    init_reminders,
+    mark_reminder_sent,
+)
 
 
 logging.basicConfig(
@@ -32,12 +43,38 @@ logging.basicConfig(
 )
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
-
 logger = logging.getLogger(__name__)
 
 
+FINANCIAL_TIPS = [
+    "Записывай даже небольшие расходы. "
+    "Они могут заметно влиять на бюджет.",
+
+    "Попробуй откладывать часть дохода сразу "
+    "после его получения.",
+
+    "Разделяй обязательные расходы и "
+    "необязательные покупки.",
+
+    "Перед крупной покупкой сравни предложения "
+    "и оцени необходимость покупки.",
+
+    "Проверяй регулярные подписки и отключай "
+    "те, которыми не пользуешься.",
+
+    "Создай финансовую подушку для "
+    "непредвиденных расходов.",
+
+    "Устанавливай реалистичный месячный бюджет "
+    "и регулярно проверяй остаток.",
+
+    "Планируй обязательные платежи заранее, "
+    "чтобы избежать просрочек.",
+]
+
+
 def parse_amount(value):
-    """Преобразует рубли в целое количество копеек."""
+    """Преобразует сумму в рублях в целое число копеек."""
     try:
         amount = Decimal(value.replace(",", "."))
 
@@ -59,11 +96,9 @@ def parse_amount(value):
 
 
 def format_money(kopecks):
-    """Форматирует денежную сумму в рублях."""
+    """Форматирует денежную сумму."""
     sign = "-" if kopecks < 0 else ""
-
     rubles, remainder = divmod(abs(kopecks), 100)
-
     formatted = f"{rubles:,}".replace(",", " ")
 
     if remainder:
@@ -73,7 +108,7 @@ def format_money(kopecks):
 
 
 def current_month():
-    """Возвращает текущий месяц в формате YYYY-MM."""
+    """Возвращает текущий месяц по UTC."""
     return datetime.now(timezone.utc).strftime("%Y-%m")
 
 
@@ -93,13 +128,16 @@ async def start(
     await update.message.reply_text(
         f"Привет, {name}! 👋\n\n"
         "💰 Добро пожаловать в MoneyTrack!\n\n"
-        "Я помогу тебе управлять личными финансами.\n\n"
+        "Я помогу управлять личными финансами.\n\n"
         "📈 /income — добавить доход\n"
         "📉 /expense — добавить расход\n"
         "💳 /balance — посмотреть баланс\n"
         "📊 /stats — статистика расходов\n"
-        "🎯 /budget — управление бюджетом\n"
-        "❓ /help — список команд"
+        "🎯 /budget — месячный бюджет\n"
+        "⏰ /remind — напоминание о платеже\n"
+        "📋 /reminders — список напоминаний\n"
+        "💡 /tips — финансовый совет\n"
+        "❓ /help — все команды"
     )
 
 
@@ -107,15 +145,14 @@ async def help_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    """Показывает справку по командам бота."""
+    """Показывает справку по всем командам."""
     if update.message is None:
         return
 
     await update.message.reply_text(
         "💰 MoneyTrack — список команд\n\n"
-        "🚀 ОСНОВНЫЕ:\n"
-        "/start — запустить бота\n"
-        "/help — показать справку\n\n"
+        "/start — приветствие\n"
+        "/help — помощь\n\n"
         "📈 ДОХОДЫ:\n"
         "/income 50000 Зарплата\n\n"
         "📉 РАСХОДЫ:\n"
@@ -124,16 +161,23 @@ async def help_command(
         "💳 БАЛАНС:\n"
         "/balance\n\n"
         "📊 СТАТИСТИКА:\n"
-        "/stats — расходы по категориям за месяц\n\n"
+        "/stats — расходы за месяц\n\n"
         "🎯 БЮДЖЕТ:\n"
         "/budget 30000 — установить лимит\n"
         "/budget — проверить остаток\n\n"
-        "Все операции сохраняются автоматически."
+        "⏰ НАПОМИНАНИЯ:\n"
+        "/remind 31.10.2026 18:00 Оплатить интернет\n"
+        "/reminders — показать напоминания\n"
+        "/cancelremind 1 — удалить напоминание № 1\n\n"
+        "💡 СОВЕТЫ:\n"
+        "/tips — случайный финансовый совет\n\n"
+        "Время напоминаний — местное время "
+        "компьютера, на котором работает бот."
     )
 
 
 async def save_operation(update, context, kind):
-    """Проверяет и сохраняет финансовую операцию."""
+    """Проверяет и сохраняет доход или расход."""
     if update.message is None:
         return
 
@@ -144,7 +188,7 @@ async def save_operation(update, context, kind):
         command = "/income" if kind == "income" else "/expense"
 
         await update.message.reply_text(
-            "❌ Неправильный формат команды.\n\n"
+            "❌ Неправильный формат.\n\n"
             f"Пример: {command} 1500 Продукты"
         )
         return
@@ -154,8 +198,7 @@ async def save_operation(update, context, kind):
     if amount is None:
         await update.message.reply_text(
             "❌ Введи положительную сумму "
-            "с точностью до копеек.\n\n"
-            "Пример: 1500 или 199,90"
+            "с точностью до копеек."
         )
         return
 
@@ -183,9 +226,7 @@ async def save_operation(update, context, kind):
         )
         return
 
-    operation_name = (
-        "Доход" if kind == "income" else "Расход"
-    )
+    operation_name = "Доход" if kind == "income" else "Расход"
 
     await update.message.reply_text(
         f"✅ {operation_name} добавлен!\n\n"
@@ -198,7 +239,7 @@ async def income(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    """Добавляет доход пользователя."""
+    """Добавляет доход."""
     await save_operation(update, context, "income")
 
 
@@ -206,7 +247,7 @@ async def expense(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    """Добавляет расход пользователя."""
+    """Добавляет расход."""
     await save_operation(update, context, "expense")
 
 
@@ -214,11 +255,8 @@ async def balance(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    """Показывает текущий баланс пользователя."""
-    if update.message is None:
-        return
-
-    if update.effective_user is None:
+    """Показывает финансовый баланс."""
+    if update.message is None or update.effective_user is None:
         return
 
     try:
@@ -248,11 +286,8 @@ async def stats(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    """Показывает расходы по категориям за текущий месяц."""
-    if update.message is None:
-        return
-
-    if update.effective_user is None:
+    """Показывает статистику расходов за текущий месяц."""
+    if update.message is None or update.effective_user is None:
         return
 
     month = current_month()
@@ -280,7 +315,7 @@ async def stats(
     total = sum(amount for _, amount in rows)
 
     lines = [
-        f"📊 Статистика расходов за {month}",
+        f"📊 Расходы за {month}",
         "",
     ]
 
@@ -299,20 +334,15 @@ async def stats(
         f"💸 Всего потрачено: {format_money(total)}",
     ])
 
-    await update.message.reply_text(
-        "\n".join(lines)
-    )
+    await update.message.reply_text("\n".join(lines))
 
 
 async def budget(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    """Устанавливает и показывает бюджет за текущий месяц."""
-    if update.message is None:
-        return
-
-    if update.effective_user is None:
+    """Устанавливает и показывает месячный бюджет."""
+    if update.message is None or update.effective_user is None:
         return
 
     month = current_month()
@@ -320,8 +350,7 @@ async def budget(
 
     if len(context.args) > 1:
         await update.message.reply_text(
-            "❌ Неправильный формат.\n\n"
-            "Используй /budget или /budget 30000"
+            "❌ Используй /budget или /budget 30000"
         )
         return
 
@@ -331,38 +360,23 @@ async def budget(
 
             if limit is None:
                 await update.message.reply_text(
-                    "❌ Укажи положительную сумму.\n\n"
-                    "Пример: /budget 30000"
+                    "❌ Пример: /budget 30000"
                 )
                 return
 
-            set_monthly_budget(
-                user_id,
-                month,
-                limit,
-            )
+            set_monthly_budget(user_id, month, limit)
 
-        limit = get_monthly_budget(
-            user_id,
-            month,
-        )
+        limit = get_monthly_budget(user_id, month)
 
         if limit is None:
             await update.message.reply_text(
                 "🎯 Бюджет ещё не установлен.\n\n"
-                "Установи его командой:\n"
-                "/budget 30000"
+                "Пример: /budget 30000"
             )
             return
 
-        rows = get_monthly_expense_stats(
-            user_id,
-            month,
-        )
-
-        spent = sum(
-            amount for _, amount in rows
-        )
+        rows = get_monthly_expense_stats(user_id, month)
+        spent = sum(amount for _, amount in rows)
 
     except sqlite3.Error:
         logger.exception("Ошибка работы с бюджетом")
@@ -375,13 +389,10 @@ async def budget(
     remaining = limit - spent
 
     if remaining >= 0:
-        status = (
-            f"✅ Осталось: {format_money(remaining)}"
-        )
+        status = f"✅ Осталось: {format_money(remaining)}"
     else:
         status = (
-            f"⚠️ Бюджет превышен на "
-            f"{format_money(-remaining)}"
+            f"⚠️ Превышение: {format_money(-remaining)}"
         )
 
     await update.message.reply_text(
@@ -392,23 +403,262 @@ async def budget(
     )
 
 
+async def remind(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    """Создаёт напоминание о будущем платеже."""
+    if update.message is None or update.effective_user is None:
+        return
+
+    if update.effective_chat is None:
+        return
+
+    if update.effective_chat.type != "private":
+        await update.message.reply_text(
+            "🔒 Напоминания доступны только в личном чате."
+        )
+        return
+
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "⏰ Формат напоминания:\n\n"
+            "/remind ДД.ММ.ГГГГ ЧЧ:ММ Описание\n\n"
+            "Пример:\n"
+            "/remind 31.10.2026 18:00 Оплатить интернет"
+        )
+        return
+
+    date_text = " ".join(context.args[:2])
+    note = " ".join(context.args[2:]).strip()
+
+    if not note or len(note) > 120:
+        await update.message.reply_text(
+            "❌ Описание должно содержать "
+            "от 1 до 120 символов."
+        )
+        return
+
+    try:
+        # Наивная дата трактуется как местное время Mac.
+        due_datetime = datetime.strptime(
+            date_text, "%d.%m.%Y %H:%M"
+        ).astimezone()
+
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Неправильная дата.\n"
+            "Пример: 31.10.2026 18:00"
+        )
+        return
+
+    now = datetime.now().astimezone()
+
+    if due_datetime <= now:
+        await update.message.reply_text(
+            "❌ Выбери дату и время в будущем."
+        )
+        return
+
+    if due_datetime > now + timedelta(days=365):
+        await update.message.reply_text(
+            "❌ Напоминание можно создать "
+            "не более чем на год вперёд."
+        )
+        return
+
+    try:
+        reminder_id = add_reminder(
+            user_id=update.effective_user.id,
+            chat_id=update.effective_chat.id,
+            due_at=int(due_datetime.timestamp()),
+            note=note,
+        )
+
+    except sqlite3.Error:
+        logger.exception("Ошибка создания напоминания")
+
+        await update.message.reply_text(
+            "❌ Не удалось сохранить напоминание."
+        )
+        return
+
+    await update.message.reply_text(
+        "✅ Напоминание создано!\n\n"
+        f"🔢 Номер: {reminder_id}\n"
+        f"📅 Дата: {due_datetime:%d.%m.%Y}\n"
+        f"🕒 Время: {due_datetime:%H:%M}\n"
+        f"📝 Задача: {note}"
+    )
+
+
+async def reminders_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    """Показывает активные напоминания пользователя."""
+    if update.message is None or update.effective_user is None:
+        return
+
+    if update.effective_chat.type != "private":
+        await update.message.reply_text(
+            "🔒 Используй эту команду в личном чате."
+        )
+        return
+
+    try:
+        rows = get_pending_reminders(
+            update.effective_user.id
+        )
+
+    except sqlite3.Error:
+        logger.exception("Ошибка получения напоминаний")
+
+        await update.message.reply_text(
+            "❌ Не удалось получить напоминания."
+        )
+        return
+
+    if not rows:
+        await update.message.reply_text(
+            "📋 Активных напоминаний пока нет."
+        )
+        return
+
+    lines = ["📋 Твои напоминания:", ""]
+
+    for reminder_id, due_at, note in rows:
+        date_text = datetime.fromtimestamp(
+            due_at
+        ).strftime("%d.%m.%Y %H:%M")
+
+        lines.append(
+            f"#{reminder_id} — {date_text}\n"
+            f"📝 {note}\n"
+        )
+
+    lines.append(
+        "Удалить: /cancelremind НОМЕР"
+    )
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cancel_reminder_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    """Удаляет напоминание по номеру."""
+    if update.message is None or update.effective_user is None:
+        return
+
+    if update.effective_chat.type != "private":
+        await update.message.reply_text(
+            "🔒 Используй эту команду в личном чате."
+        )
+        return
+
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.message.reply_text(
+            "❌ Пример: /cancelremind 1"
+        )
+        return
+
+    try:
+        deleted = cancel_reminder(
+            update.effective_user.id,
+            int(context.args[0]),
+        )
+
+    except sqlite3.Error:
+        logger.exception("Ошибка удаления напоминания")
+
+        await update.message.reply_text(
+            "❌ Не удалось удалить напоминание."
+        )
+        return
+
+    if deleted:
+        await update.message.reply_text(
+            "✅ Напоминание удалено."
+        )
+    else:
+        await update.message.reply_text(
+            "❌ Такое активное напоминание не найдено."
+        )
+
+
+async def tips(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    """Отправляет случайный совет по личным финансам."""
+    if update.message is None:
+        return
+
+    advice = random.choice(FINANCIAL_TIPS)
+
+    await update.message.reply_text(
+        "💡 Финансовый совет MoneyTrack\n\n"
+        f"{advice}"
+    )
+
+
+async def send_due_reminders(context: ContextTypes.DEFAULT_TYPE):
+    """Проверяет сроки платежей и отправляет напоминания."""
+    try:
+        rows = get_due_reminders(int(time.time()))
+
+    except sqlite3.Error:
+        logger.exception("Ошибка проверки напоминаний")
+        return
+
+    for reminder_id, chat_id, note in rows:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "⏰ MoneyTrack — напоминание!\n\n"
+                    f"💳 {note}\n\n"
+                    "Проверь, не пора ли оплатить счёт."
+                ),
+            )
+
+        except TelegramError:
+            logger.exception(
+                "Не удалось отправить напоминание %s",
+                reminder_id,
+            )
+            continue
+
+        try:
+            mark_reminder_sent(reminder_id)
+
+        except sqlite3.Error:
+            logger.exception(
+                "Не удалось отметить напоминание %s",
+                reminder_id,
+            )
+
+
 async def echo(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    """Отвечает на обычные текстовые сообщения."""
+    """Подсказывает пользователю доступные команды."""
     if update.message is None:
         return
 
     await update.message.reply_text(
         "💰 Я финансовый помощник MoneyTrack!\n\n"
-        "Используй /help, чтобы узнать мои команды."
+        "Используй /help для просмотра команд."
     )
 
 
 def main():
-    """Создаёт базу данных и запускает Telegram-бота."""
+    """Инициализирует хранилища и запускает Telegram-бота."""
     init_database()
+    init_reminders()
 
     application = (
         Application.builder()
@@ -416,39 +666,44 @@ def main():
         .build()
     )
 
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("income", income))
+    application.add_handler(CommandHandler("expense", expense))
+    application.add_handler(CommandHandler("balance", balance))
+    application.add_handler(CommandHandler("stats", stats))
+    application.add_handler(CommandHandler("budget", budget))
+    application.add_handler(CommandHandler("remind", remind))
+
     application.add_handler(
-        CommandHandler("start", start)
+        CommandHandler("reminders", reminders_command)
     )
 
     application.add_handler(
-        CommandHandler("help", help_command)
+        CommandHandler(
+            "cancelremind",
+            cancel_reminder_command,
+        )
     )
 
-    application.add_handler(
-        CommandHandler("income", income)
-    )
-
-    application.add_handler(
-        CommandHandler("expense", expense)
-    )
-
-    application.add_handler(
-        CommandHandler("balance", balance)
-    )
-
-    application.add_handler(
-        CommandHandler("stats", stats)
-    )
-
-    application.add_handler(
-        CommandHandler("budget", budget)
-    )
+    application.add_handler(CommandHandler("tips", tips))
 
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             echo,
         )
+    )
+
+    if application.job_queue is None:
+        raise RuntimeError(
+            "Установи python-telegram-bot[job-queue]"
+        )
+
+    application.job_queue.run_repeating(
+        callback=send_due_reminders,
+        interval=15,
+        first=5,
     )
 
     logger.info("MoneyTrack запущен")
